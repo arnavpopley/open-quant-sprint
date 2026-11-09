@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import math
+import os
+import re
+import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from src.audit import holdout_start_problem
-from src.contrib.yousof import DQS_MIN, check_continuation
+from src.audit import _sha256, holdout_start_problem
+from src.contrib.yousof import (
+    CHECKED_VERSIONS,
+    DQS_MIN,
+    AuditSummary,
+    audit_table,
+    check_continuation,
+    file_hash,
+    main,
+    parse_audit_report,
+    split_reports,
+)
 from src.quality import audit_dataset
 
 TRAIN = Path("data/train_1h.parquet")
@@ -338,6 +356,26 @@ def test_silent_funding_download_is_a_warning(split: Split) -> None:
     ]
 
 
+def test_zero_volume_for_a_whole_symbol_is_a_warning(split: Split) -> None:
+    # Valid OHLC, so the quality checks pass it; a failed download?
+    prev, new = split
+    sym = _sym(new)
+    broken = new.copy()
+    volumes = ["volume", "quote_volume", "taker_buy_quote_volume"]
+    broken.loc[broken["symbol"] == sym, volumes] = 0.0
+    assert check_continuation(prev, broken) == [
+        f"warning: volume is zero in every bar for {sym}; did the "
+        "download fail?"
+    ]
+
+
+def test_as_of_that_cannot_be_read_is_an_error(split: Split) -> None:
+    prev, new = split
+    assert check_continuation(prev, new, as_of="not a time") == [
+        "error: as_of is not a time, so unclosed bars were not checked"
+    ]
+
+
 def test_price_jump_at_the_seam_is_a_warning(split: Split) -> None:
     # A redenominated contract (PEPE -> 1000PEPE) continues the keys
     # but not the prices.
@@ -358,3 +396,775 @@ def test_errors_come_before_warnings(split: Split) -> None:
     problems = check_continuation(prev, broken)
     kinds = [line.split(":")[0] for line in problems]
     assert kinds == ["error", "warning"]
+
+
+# --- Part 2: the audit report as a table -----------------------------
+
+REPORTS = Path(__file__).parent / "audit_reports"
+PASS_REPORT = "baseline_flow_holdout_v1.3.1.txt"
+REJECT_REPORT = "baseline_flow_v1.3.1.txt"
+CAUSAL_14 = (
+    "Causal invariance verified across 14 prefix cuts "
+    "(max diff=0.00e+00, seed=20261107)"
+)
+TRAIN_SHA = "d68e6159bbdfb2e3"  # data/train_1h.parquet, as the audit prints
+FORGING_SHA = "b95f1fc02841b1f2"
+WITHHELD_NOTE = (
+    "not read, as they come below a strategy's error message, which "
+    "before audit 1.3.2 could add lines of its own: lag test, null check, "
+    "wick share, fee table, 5 bps row, out-of-sample Sharpe"
+)
+VERSION_NOTE = (
+    "audit v{} is not one this parser was checked against (1.0.0 to "
+    "1.3.2); compare the table with the report"
+)
+
+# What the saved reports hold, read off them by hand. Fields not named
+# are None, problems [].
+BASELINE = dict(
+    strategy="baseline_flow.py", version="1.3.1", commit="f9c2892",
+    strategy_sha256="d92db270a5952c37", data_sha256=TRAIN_SHA,
+    verdict="REJECT", causality_passed=True, causality_detail=CAUSAL_14,
+    dqs=99.93, sharpe_5bps=-1.53, sharpe_5bps_ci=(-3.00, 0.07),
+    turnover_5bps=0.0522, oos_sharpe=2.17, oos_sharpe_ci=(-0.52, 4.86),
+    lag1_sharpe=-1.53, lag2_sharpe=-1.53, lag_passed=True,
+    null_mean=-0.0, null_sd=0.74, null_passed=True,
+    wick_share_pct=2.2, wick_passed=True,
+)
+LEAKY = dict(
+    strategy="leaky_example.py", version="1.3.1", commit="f9c2892",
+    strategy_sha256="dd9387fbb6752cb7", data_sha256=TRAIN_SHA,
+    verdict="REJECT", causality_passed=False,
+    causality_detail="Look-ahead leak detected at 2025-07-13 "
+    "13:00:00+00:00: max|w_trunc - w_full| = 3.644e+00 > 1.0e-09 "
+    "(seed=20261107)",
+    dqs=99.93, sharpe_5bps=-9.21, sharpe_5bps_ci=(-10.85, -7.56),
+    turnover_5bps=1.3648, oos_sharpe=-13.46,
+    oos_sharpe_ci=(-16.52, -10.88), lag1_sharpe=-9.21,
+    lag2_sharpe=-10.33, lag_passed=False, null_mean=-0.11,
+    null_sd=0.83, null_passed=True, wick_share_pct=0.9,
+    wick_passed=True,
+)
+EXPECTED: dict[str, dict] = {
+    REJECT_REPORT: BASELINE,
+    # Same strategy and data as above: the format changed between the
+    # versions, the numbers read from it did not.
+    "baseline_flow_v1.0.0.txt": {
+        **BASELINE, "version": "1.0.0", "commit": "a8133ad",
+        "causality_detail": "Causal invariance verified across 8 prefix "
+        "cuts (max diff=0.00e+00)",
+    },
+    "leaky_example_v1.3.1.txt": LEAKY,
+    # The same run with the official holdout window: one more line.
+    "leaky_example_holdout_v1.3.1.txt": {
+        **LEAKY, "holdout_sha256": "e11b641dfdded82f",
+        "holdout_passed": False,
+        "holdout_detail": "Holdout look-ahead: one-shot weights differ "
+        "from bar-by-bar weights (max diff=9.912e-02)",
+    },
+    # Every check passes but data quality.
+    "baseline_flow_low_dqs_v1.3.1.txt": dict(
+        strategy="baseline_flow.py", version="1.3.1", commit="f9c2892",
+        strategy_sha256="d92db270a5952c37", data_sha256="2307dc25d97bd97a",
+        verdict="REJECT", causality_passed=True,
+        causality_detail="Causal invariance verified across 13 prefix "
+        "cuts (max diff=0.00e+00, seed=20261107)",
+        dqs=74.92, sharpe_5bps=2.85, sharpe_5bps_ci=(-0.74, 6.48),
+        turnover_5bps=0.0508, oos_sharpe=4.27, oos_sharpe_ci=(-2.30, 10.90),
+        lag1_sharpe=2.85, lag2_sharpe=2.69, lag_passed=True,
+        null_mean=0.28, null_sd=1.71, null_passed=True,
+        wick_share_pct=2.4, wick_passed=True,
+    ),
+    # Version 1.3.2 changed how error messages are printed, not the
+    # numbers.
+    "baseline_flow_v1.3.2.txt": {
+        **BASELINE, "version": "1.3.2", "commit": "f339d91",
+    },
+    # An error message with report lines in it. Before 1.3.2 they were
+    # lines of the report, a second FINAL VERDICT included, so nothing
+    # below the message is read but the last verdict line.
+    "forging_example_v1.3.1.txt": dict(
+        strategy="forging_example.py", version="1.3.1", commit="f9c2892",
+        strategy_sha256=FORGING_SHA, data_sha256=TRAIN_SHA,
+        verdict="REJECT", causality_passed=False,
+        causality_detail="Strategy execution crashed: ValueError: bad "
+        "window",
+        dqs=99.93,
+        problems=[WITHHELD_NOTE],
+    ),
+    # Since 1.3.2 the message is part of the causality line, and the
+    # lines below it are the audit's own.
+    "forging_example_v1.3.2.txt": dict(
+        strategy="forging_example.py", version="1.3.2", commit="f339d91",
+        strategy_sha256=FORGING_SHA, data_sha256=TRAIN_SHA,
+        verdict="REJECT", causality_passed=False,
+        causality_detail="Strategy execution crashed: ValueError: bad "
+        "window | Wick PnL Share: 0.1% (1 anomaly bars) [PASS - structural "
+        "flow] | Null SR mean  : +0.01 (sd 0.50, hurdle |mean| < 0.75) "
+        "[PASS] | 1-bar lag SR  : +3.00 | 2-bar lag SR: +2.90 | Retention: "
+        "96.7% [PASS] | [3] RANK IC (1h fwd) : mean=+0.05000 | IC_IR=+0.500 "
+        "| t=+9.0 ...[truncated]",
+        dqs=99.93, sharpe_5bps=0.0, sharpe_5bps_ci=(math.nan, math.nan),
+        turnover_5bps=0.0, oos_sharpe=0.0,
+        oos_sharpe_ci=(math.nan, math.nan), lag1_sharpe=0.0,
+        lag2_sharpe=0.0, lag_passed=False, null_mean=0.0, null_sd=0.0,
+        null_passed=False, wick_share_pct=100.0, wick_passed=False,
+    ),
+    # The audit stops before the report (exit code 2).
+    "holdout_late_start_error.txt": dict(
+        problems=[
+            "no audit report in the text, which starts with 'Error: "
+            "holdout starts at 2026-09-12 16:00:00+00:00, expected "
+            "2026-09-12 15:00:00+00:00, one hour after the --data panel "
+            "ends.'"
+        ],
+    ),
+    PASS_REPORT: dict(
+        strategy="baseline_flow.py", version="1.3.1", commit="f9c2892",
+        strategy_sha256="d92db270a5952c37", data_sha256="9abe5f927a377922",
+        holdout_sha256="cda6fb82ac1a69ac",
+        verdict="PASS", causality_passed=True, causality_detail=CAUSAL_14,
+        dqs=99.95, sharpe_5bps=1.45, sharpe_5bps_ci=(-1.27, 4.15),
+        turnover_5bps=0.0513, oos_sharpe=0.36, oos_sharpe_ci=(-4.66, 6.02),
+        lag1_sharpe=1.45, lag2_sharpe=1.64, lag_passed=True,
+        null_mean=0.50, null_sd=1.33, null_passed=True,
+        wick_share_pct=1.8, wick_passed=True, holdout_passed=True,
+        holdout_sharpe=3.10, holdout_sharpe_ci=(-6.78, 13.09),
+        holdout_detail="bar-by-bar evaluation",
+    ),
+    "crashing_example_v1.3.1.txt": dict(
+        strategy="crashing_example.py", version="1.3.1", commit="f9c2892",
+        strategy_sha256="5f622143d4d316cb", data_sha256=TRAIN_SHA,
+        verdict="REJECT", causality_passed=False,
+        causality_detail="Strategy execution crashed: ValueError: feature "
+        "window of 5000 bars is longer than the panel",
+        dqs=99.93,
+        # Before 1.3.2 an error message can go on in lines of its own,
+        # so nothing below it is read.
+        problems=[WITHHELD_NOTE],
+    ),
+    # Before audit 1.0.0: no version line, no intervals, another null
+    # check.
+    "baseline_flow_6ed3535.txt": dict(
+        strategy="baseline_flow.py", verdict="PASS", causality_passed=True,
+        causality_detail="Causal invariance verified across 3 prefix "
+        "cuts (max diff=0.00e+00)",
+        dqs=99.93, sharpe_5bps=3.15, turnover_5bps=0.0504, oos_sharpe=4.19,
+        lag1_sharpe=3.15, lag2_sharpe=3.14, lag_passed=True,
+        wick_share_pct=2.4, wick_passed=True,
+        problems=[
+            "missing: audit version (no 'audit v...' line); the report is "
+            "older than audit 1.0.0 or its format changed",
+            "missing: null check (no 'Null SR mean' line)",
+            "missing: 95 % interval of the Sharpe at 5 bps (no CI column "
+            "in the fee table)",
+        ],
+    ),
+}
+
+
+def _report(name: str) -> str:
+    return (REPORTS / name).read_text(encoding="utf-8")
+
+
+def _edit(text: str, old: str, new: str) -> str:
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+def _plain(values: dict) -> dict:
+    """``values`` with NaN as "nan": NaN is not equal to itself."""
+
+    def plain(value: object) -> object:
+        if isinstance(value, tuple):
+            return tuple(plain(v) for v in value)
+        if isinstance(value, float) and math.isnan(value):
+            return "nan"
+        return value
+
+    return {key: plain(value) for key, value in values.items()}
+
+
+def _parsed(text: str) -> dict:
+    return _plain(parse_audit_report(text).as_dict())
+
+
+def _table(text: str) -> str:
+    return audit_table(parse_audit_report(text))
+
+
+def _expected(name: str, **changes: object) -> dict:
+    return _plain({**AuditSummary().as_dict(), **EXPECTED[name], **changes})
+
+
+def _rows(table: str) -> dict[str, list[str]]:
+    """Result and value of each table row, by label."""
+    rows = {}
+    for line in table.splitlines():
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", line)[1:-1]]
+        if len(cells) == 3 and cells[0] not in ("Check", "---"):
+            rows[cells[0]] = cells[1:]
+    return rows
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED))
+def test_saved_report_is_read_field_by_field(name: str) -> None:
+    assert _parsed(_report(name)) == _expected(name)
+
+
+def test_every_saved_report_is_tested_and_noted() -> None:
+    # The README next to the reports names the 'audit v...' line each
+    # one came from.
+    assert sorted(p.name for p in REPORTS.glob("*.txt")) == sorted(EXPECTED)
+    readme = (REPORTS / "README.md").read_text(encoding="utf-8")
+    for name, fields in EXPECTED.items():
+        version = fields.get("version")
+        line = f"`audit v{version}`" if version else "none"
+        assert f"| `{name}` | {line} |" in readme
+    assert {f["version"] for f in EXPECTED.values() if "version" in f} <= set(
+        CHECKED_VERSIONS
+    )
+
+
+def test_table_of_a_pass_with_holdout() -> None:
+    table = _table(_report(PASS_REPORT))
+    assert table.splitlines() == [
+        "#### `baseline_flow.py`",
+        "",
+        "| Check | Result | Value |",
+        "| --- | --- | --- |",
+        "| Verdict | PASS | audit v1.3.1, commit f9c2892 |",
+        "| Data | | panel `9abe5f927a377922`, holdout `cda6fb82ac1a69ac` |",
+        f"| Causality | pass | `{CAUSAL_14}` |",
+        "| Sharpe @ 5 bps | pass | +1.45, 95% CI [-1.27, +4.15] "
+        "includes 0 |",
+        "| Out-of-sample Sharpe | pass | +0.36, 95% CI [-4.66, +6.02] "
+        "includes 0 |",
+        "| Lag test | pass | 2-bar lag Sharpe +1.64, 1-bar +1.45 |",
+        "| Null check | pass | mean Sharpe +0.50, sd 1.33 |",
+        "| Wick share | pass | 1.8% of positive PnL |",
+        "| Turnover @ 5 bps | pass | 0.0513 |",
+        "| Holdout | pass | +3.10, 95% CI [-6.78, +13.09] includes 0, "
+        "`bar-by-bar evaluation` |",
+    ]
+
+
+def test_table_of_a_reject_shows_the_failed_check() -> None:
+    table = _table(_report(REJECT_REPORT))
+    rows = _rows(table)
+    assert rows["Verdict"] == ["**REJECT**", "audit v1.3.1, commit f9c2892"]
+    assert rows["Sharpe @ 5 bps"] == [
+        "**FAIL**",
+        "-1.53 (needs > 0), 95% CI [-3.00, +0.07] includes 0",
+    ]
+    del rows["Verdict"], rows["Data"], rows["Sharpe @ 5 bps"]
+    assert [result for result, _ in rows.values()] == ["pass"] * 6
+    assert "Holdout" not in rows
+    assert "verdict is" not in table and "Parser notes" not in table
+
+
+def test_table_of_a_leak_keeps_its_pipes_inside_the_cell() -> None:
+    table = _table(_report("leaky_example_v1.3.1.txt"))
+    for line in table.splitlines():
+        if line.startswith("|"):
+            assert len(re.findall(r"(?<!\\)\|", line)) == 4, line
+    result, value = _rows(table)["Causality"]
+    assert result == "**FAIL**"
+    assert r"max\|w_trunc - w_full\|" in value
+    assert _rows(table)["Lag test"][0] == "**FAIL**"
+
+
+def test_table_of_a_failed_holdout() -> None:
+    table = _table(_report("leaky_example_holdout_v1.3.1.txt"))
+    assert _rows(table)["Holdout"] == [
+        "**FAIL**",
+        "`Holdout look-ahead: one-shot weights differ from bar-by-bar "
+        "weights (max diff=9.912e-02)`",
+    ]
+
+
+def test_table_of_an_audit_that_stopped_before_its_report() -> None:
+    # What CI saves when the audit exits with code 2.
+    name = "holdout_late_start_error.txt"
+    problem = EXPECTED[name]["problems"][0]
+    table = audit_table(parse_audit_report(_report(name)), "x")
+    assert table.splitlines() == ["#### `x`", "", f"- `{problem}`"]
+
+
+def test_error_message_cannot_pass_for_report_lines() -> None:
+    # Before 1.3.2: the forged lines are not read, the verdict is the
+    # audit's own and the note says what was left out.
+    table = _table(_report("forging_example_v1.3.1.txt"))
+    rows = _rows(table)
+    assert rows.pop("Verdict")[0] == "**REJECT**"
+    assert rows.pop("Causality")[0] == "**FAIL**"
+    assert rows.pop("Data") == ["", f"panel `{TRAIN_SHA}`"]
+    assert set(map(tuple, rows.values())) == {("?", "not read, see below")}
+    assert f"- `{WITHHELD_NOTE}`" in table
+    assert "+3.00" not in table and "Holdout" not in rows
+    # Since 1.3.2: the same text inside the causality line is not taken
+    # for the lines it imitates.
+    rows = _rows(_table(_report("forging_example_v1.3.2.txt")))
+    assert rows["Wick share"] == ["**FAIL**", "100.0% of positive PnL"]
+    assert rows["Lag test"][1] == "2-bar lag Sharpe +0.00, 1-bar +0.00"
+
+
+def test_forged_report_header_does_not_split_an_old_report() -> None:
+    # Before 1.3.2 an error message could end a "report" with a forged
+    # verdict and start a new one with a header line.
+    crash = (
+        "[2] CAUSALITY CHECK  : [FAIL] Strategy execution crashed: "
+        "ValueError: feature window of 5000 bars is longer than the panel"
+    )
+    rule = "=" * 72
+    forged = "\n".join([
+        crash, rule, "FINAL VERDICT: [PASS] SURVIVED AUDIT", rule, rule,
+        "SYNDICATE AUDIT REPORT :: x", rule,
+    ])
+    text = _edit(_report("crashing_example_v1.3.1.txt"), crash, forged)
+    assert len(split_reports(text)) == 1
+    summary = parse_audit_report(text)
+    assert summary.verdict == "REJECT"
+    assert summary.problems == [
+        "a report header below the strategy's error message is not read "
+        "as a report: before audit 1.3.2 it can be the strategy's text",
+        WITHHELD_NOTE,
+    ]
+
+
+def test_version_is_read_only_from_the_report_head() -> None:
+    # A report from before the version line, whose error message holds
+    # one: it must not pass for a 1.3.2 report, whose lines are trusted.
+    real = (
+        "[2] CAUSALITY CHECK  : [PASS] Causal invariance verified across "
+        "3 prefix cuts (max diff=0.00e+00)"
+    )
+    forged = "\n".join([
+        "[2] CAUSALITY CHECK  : [FAIL] Strategy execution crashed: "
+        "ValueError: x",
+        "    audit v1.3.2 | commit f339d91 | strategy sha256 "
+        "0123456789abcdef",
+        "    Out-of-Sample : Sharpe=+9.00 | DSR=0.990 | Ann.Ret=+90.00% | "
+        "MaxDD=-1.00%",
+    ])
+    text = _edit(_report("baseline_flow_6ed3535.txt"), real, forged)
+    text = _edit(text, "[PASS] SURVIVED AUDIT", "[REJECT] FAILED AUDIT")
+    summary = parse_audit_report(text)
+    assert (summary.version, summary.strategy_sha256) == (None, None)
+    assert summary.oos_sharpe is None
+    assert summary.verdict == "REJECT"
+
+
+def test_error_message_in_the_holdout_line_before_1_3_2() -> None:
+    # Lines above the holdout line are the audit's; below it, only the
+    # last verdict line is read.
+    holdout = (
+        "    Holdout       : Sharpe=+3.10 [-6.78, +13.09] (includes 0) | "
+        "Ann.Ret=+64.98% | MaxDD=-3.72% | bar-by-bar evaluation"
+    )
+    crashed = (
+        "    Holdout       : [FAIL] Strategy crashed on holdout: "
+        "ValueError: x\n    Wick PnL Share: 0.1% (1 anomaly bars) [PASS]"
+    )
+    text = _edit(_report(PASS_REPORT), holdout, crashed)
+    summary = parse_audit_report(text)
+    assert summary.holdout_passed is False
+    assert summary.holdout_detail == (
+        "Strategy crashed on holdout: ValueError: x"
+    )
+    assert (summary.sharpe_5bps, summary.oos_sharpe) == (1.45, 0.36)
+    assert summary.wick_share_pct is None and summary.lag_passed is None
+    assert summary.verdict == "PASS"
+    assert summary.problems == [
+        "not read, as they come below a strategy's error message, which "
+        "before audit 1.3.2 could add lines of its own: lag test, null "
+        "check, wick share"
+    ]
+
+
+def test_table_of_a_crash() -> None:
+    # The values of a crashed run are printed as +0.00 and 0.0000,
+    # which rounding cannot tell from slightly above the gate.
+    report = _report("forging_example_v1.3.2.txt")
+    rows = _rows(_table(report))
+    assert rows["Sharpe @ 5 bps"] == ["?", "+0.00 (needs > 0), 95% CI n/a"]
+    assert rows["Turnover @ 5 bps"] == ["?", "0.0000 (needs > 1e-05)"]
+    assert rows["Causality"][0] == "**FAIL**"
+
+
+def test_table_of_a_report_older_than_the_version_line() -> None:
+    table = _table(_report("baseline_flow_6ed3535.txt"))
+    rows = _rows(table)
+    assert rows["Verdict"] == ["PASS", "no audit version line"]
+    assert rows["Null check"] == ["?", "not read, see below"]
+    assert rows["Sharpe @ 5 bps"] == ["pass", "+3.15"]
+    notes = table.split("Parser notes:\n\n", 1)[1].splitlines()
+    assert notes == [
+        f"- `{p}`" for p in EXPECTED["baseline_flow_6ed3535.txt"]["problems"]
+    ]
+
+
+# --- robustness: a format that changes, output that is cut ------------
+
+
+def test_missing_line_costs_only_its_own_values() -> None:
+    lines = _report(REJECT_REPORT).splitlines(keepends=True)
+    text = "".join(ln for ln in lines if "Out-of-Sample" not in ln)
+    assert _parsed(text) == _expected(
+        REJECT_REPORT, oos_sharpe=None, oos_sharpe_ci=None,
+        problems=["missing: out-of-sample Sharpe (no 'Out-of-Sample' line)"],
+    )
+
+
+def test_unparseable_values_are_named_with_their_line() -> None:
+    wick = "Wick PnL Share: 2.2% (3223 anomaly bars) [PASS - structural"
+    text = _edit(_report(REJECT_REPORT), wick, wick.replace("2.2%", "high"))
+    assert _parsed(text) == _expected(
+        REJECT_REPORT, wick_share_pct=None,
+        problems=[
+            "unparseable: wick share in 'Wick PnL Share: high (3223 "
+            "anomaly bars) [PASS - structural flow]'"
+        ],
+    )
+    # Values that fail on one line share one entry.
+    lag = "1-bar lag SR  : -1.53 | 2-bar lag SR: -1.53 | Retention: 0.0%"
+    reworded = "1-bar lag SR  : n/a, 2-bar: n/a, PASS"
+    text = _edit(_report(REJECT_REPORT), lag + " [PASS]", reworded)
+    problems = parse_audit_report(text).problems
+    assert problems == [
+        "unparseable: 1-bar lag Sharpe, 2-bar lag Sharpe, lag test result "
+        f"in '{reworded}'"
+    ]
+
+
+@pytest.mark.parametrize("version", ["1.4.0", "2.0.0rc1"])
+def test_unknown_version_is_read_and_named(version: str) -> None:
+    text = _edit(_report(REJECT_REPORT), "audit v1.3.1", f"audit v{version}")
+    note = VERSION_NOTE.format(version)
+    assert _parsed(text) == _expected(
+        REJECT_REPORT, version=version, problems=[note]
+    )
+    assert f"- `{note}`" in _table(text)
+
+
+def test_fee_table_is_read_by_its_header() -> None:
+    # Without the DSR column, the cells still go to the right names.
+    header = "  DSR(N=10)"
+    row = "-1.53  [-3.00, +0.07] (includes 0)      0.000"
+    text = _edit(_report(REJECT_REPORT), header, "")
+    text = _edit(text, row, row.removesuffix("      0.000"))
+    assert _parsed(text) == _expected(REJECT_REPORT)
+    # A cell without a column name is not given one.
+    text = _edit(_report(REJECT_REPORT), row, row + "      0.111")
+    summary = parse_audit_report(text)
+    assert (summary.sharpe_5bps, summary.turnover_5bps) == (None, None)
+    assert summary.problems == [
+        "unparseable: 5 bps row, 7 values under 6 columns in '5.0 bps"
+        "      -1.53  [-3.00, +0.07] (includes 0)      0.000      0.111"
+        "   -24.74%   -68.56%    0.0522'"
+    ]
+
+
+@pytest.mark.parametrize("name", [PASS_REPORT, "leaky_example_v1.3.1.txt"])
+def test_output_cut_anywhere_gives_no_wrong_value(name: str) -> None:
+    # A report cut off at any character: every value is either the
+    # right one or None, and a lost value is always named.
+    text = _report(name)
+    full = _parsed(text)
+    named = ("the text ends inside a line", "missing:", "no audit report")
+    for cut in range(len(text) + 1):
+        parsed = _parsed(text[:cut])
+        problems = parsed.pop("problems")
+        lost = [
+            k for k, v in parsed.items() if v is None and full[k] is not None
+        ]
+        if lost:
+            assert any(p.startswith(named) for p in problems), (cut, lost)
+        assert all(
+            v is None or v == full[k] for k, v in parsed.items()
+        ), (cut, text[:cut][-40:])
+
+
+def test_output_cut_in_a_number_is_not_read_as_another_number() -> None:
+    text = _report(REJECT_REPORT)
+    cut = text[: text.index("2-bar lag SR: -1.53") + len("2-bar lag SR: -1.5")]
+    summary = parse_audit_report(cut)
+    assert summary.lag2_sharpe is None and summary.verdict is None
+    assert summary.problems[0] == (
+        "the text ends inside a line, which is not read: '1-bar lag SR  : "
+        "-1.53 | 2-bar lag SR: -1.5'"
+    )
+    assert "missing: verdict (no 'FINAL VERDICT' line)" in summary.problems
+    assert _rows(audit_table(summary))["Verdict"] == [
+        "?", "audit v1.3.1, commit f9c2892"
+    ]
+
+
+def test_verdict_and_rows_that_disagree_get_a_note() -> None:
+    reject, accept = "[REJECT] FAILED", "[PASS] SURVIVED"
+    passed = _edit(_report(REJECT_REPORT), reject, accept)
+    assert (
+        "The verdict is PASS, but Sharpe @ 5 bps failed here: the table and "
+        "the audit disagree, so read the report."
+    ) in _table(passed)
+    rejected = _edit(_report(PASS_REPORT), accept, reject)
+    assert (
+        "The verdict is REJECT, but no row failed: the audit gates on "
+        "something this table does not show, so read the report."
+    ) in _table(rejected)
+
+
+def test_data_quality_gets_a_row_only_below_the_gate() -> None:
+    assert "Data quality" not in _rows(_table(_report(PASS_REPORT)))
+    # A REJECT for the data alone: the row says why, so no note.
+    table = _table(_report("baseline_flow_low_dqs_v1.3.1.txt"))
+    rows = _rows(table)
+    assert rows.pop("Data quality") == [
+        "**FAIL**", f"DQS 74.92/100 (needs >= {DQS_MIN:g})"
+    ]
+    assert rows.pop("Verdict")[0] == "**REJECT**"
+    assert rows.pop("Data") == ["", "panel `2307dc25d97bd97a`"]
+    assert {result for result, _ in rows.values()} == {"pass"}
+    assert "The verdict is" not in table
+
+
+@pytest.mark.parametrize(
+    ("printed", "result"), [("-0.00", "**FAIL**"), ("+0.00", "?"),
+                            ("+0.01", "pass")]
+)
+def test_rounding_decides_only_where_it_can(printed: str, result: str) -> None:
+    # -0.00 is below zero; +0.00 is zero or just above it.
+    row = "      -1.53  [-3.00, +0.07]"
+    text = _edit(_report(REJECT_REPORT), row, row.replace("-1.53", printed))
+    rows = _rows(_table(text))
+    assert rows["Sharpe @ 5 bps"][0] == result
+
+
+def test_free_text_cannot_add_markup_to_the_summary() -> None:
+    message = "feature window of 5000 bars is longer than the panel"
+    hostile = "see [docs](https://example.com) | `rm -rf` <b>now</b>"
+    report = _report("crashing_example_v1.3.1.txt")
+    table = _table(_edit(report, message, hostile))
+    assert _rows(table)["Causality"][1] == (
+        "`Strategy execution crashed: ValueError: see "
+        r"[docs](https://example.com) \| 'rm -rf' <b>now</b>`"
+    )
+    long = _edit(report, message, "x" * 500)
+    value = _rows(_table(long))["Causality"][1]
+    assert len(value) == 162 and value.endswith("...`")
+
+
+def test_several_reports_in_one_text() -> None:
+    first, second = _report(REJECT_REPORT), _report(PASS_REPORT)
+    both = first + second
+    assert split_reports(both) == [first.rstrip("\n"), second.rstrip("\n")]
+    summary = parse_audit_report(both)
+    assert summary.verdict == "REJECT"
+    assert summary.problems == [
+        "the text holds 2 reports; only the first is read"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("", "no audit report: the text is empty"),
+        ("Error: dataset not found at data/x.parquet.\n",
+         "no audit report in the text, which starts with 'Error: dataset "
+         "not found at data/x.parquet.'"),
+    ],
+)
+def test_text_without_a_report(text: str, problem: str) -> None:
+    summary = parse_audit_report(text)
+    assert summary.is_empty() and summary.problems == [problem]
+    assert audit_table(summary, "x").splitlines() == [
+        "#### `x`", "", f"- `{problem}`"
+    ]
+
+
+def test_file_hash_is_the_one_the_audit_prints(train: pd.DataFrame) -> None:
+    assert file_hash(TRAIN) == _sha256(TRAIN) == TRAIN_SHA
+    assert file_hash("no/such/file.parquet") is None
+
+
+def test_missing_data_hash_line_is_named() -> None:
+    lines = _report(REJECT_REPORT).splitlines(keepends=True)
+    text = "".join(ln for ln in lines if "data sha256" not in ln)
+    assert _parsed(text) == _expected(
+        REJECT_REPORT, data_sha256=None,
+        problems=["missing: data sha256 (no 'data sha256' line)"],
+    )
+
+
+def test_given_data_files_are_named_and_checked(
+    train: pd.DataFrame, tmp_path: Path
+) -> None:
+    summary = parse_audit_report(_report(REJECT_REPORT))
+    # The panel the report was made on: its path joins the hash.
+    files = {"panel": (str(TRAIN), file_hash(TRAIN))}
+    table = audit_table(summary, files=files)
+    assert _rows(table)["Data"] == ["", f"panel `{TRAIN}` (`{TRAIN_SHA}`)"]
+    assert "not the same data" not in table
+    # Another file, a holdout the report does not have, an unreadable
+    # file: each is named.
+    other = tmp_path / "panel.parquet"
+    other.write_bytes(b"not the panel")
+    files = {
+        "panel": (str(other), file_hash(other)),
+        "holdout": ("gone.parquet", None),
+    }
+    table = audit_table(summary, files=files)
+    assert _rows(table)["Data"][1] == (
+        f"panel `{other}` (`{file_hash(other)}`), holdout `gone.parquet` "
+        "(not readable)"
+    )
+    assert (
+        f"The report was made on panel `{TRAIN_SHA}`, but `{other}` is "
+        f"`{file_hash(other)}`: not the same data."
+    ) in table
+    assert (
+        "The report names no holdout, but `gone.parquet` was given as its "
+        "holdout."
+    ) in table
+
+
+def test_hashes_of_different_length_compare_on_the_shorter(
+    train: pd.DataFrame,
+) -> None:
+    # Should the audit ever print the whole digest, the same file still
+    # counts as the same data.
+    full = hashlib.sha256(TRAIN.read_bytes()).hexdigest()
+    summary = parse_audit_report(_report(REJECT_REPORT))
+    files = {"panel": (str(TRAIN), file_hash(TRAIN))}
+    table = audit_table(replace(summary, data_sha256=full), files=files)
+    assert "not the same data" not in table
+    other = "f" * 64
+    table = audit_table(replace(summary, data_sha256=other), files=files)
+    assert "not the same data" in table
+
+
+def test_unknown_file_role_is_an_error() -> None:
+    summary = parse_audit_report(_report(REJECT_REPORT))
+    with pytest.raises(ValueError, match="pannel"):
+        audit_table(summary, files={"pannel": ("x.parquet", None)})
+
+
+def test_stopped_audit_names_the_data_it_was_given() -> None:
+    # The error line names no file; the caller's files do.
+    name = "holdout_late_start_error.txt"
+    files = {
+        "panel": ("data/train_1h.parquet", TRAIN_SHA),
+        "holdout": ("late.parquet", "62cd580c5a46df39"),
+    }
+    table = audit_table(parse_audit_report(_report(name)), "x", files)
+    assert table.splitlines()[:3] == [
+        "#### `x`",
+        "",
+        "Run with panel `data/train_1h.parquet` (`d68e6159bbdfb2e3`), "
+        "holdout `late.parquet` (`62cd580c5a46df39`).",
+    ]
+
+
+def test_live_audit_that_stops_names_its_data(
+    train: pd.DataFrame, tmp_path: Path
+) -> None:
+    # The real audit on a holdout that starts an hour late, made from
+    # the training panel: it stops before its report (exit code 2) and
+    # its error line names no file. Run the way CI runs it (2>&1), the
+    # table names the files the run was given, and checks the line of
+    # the current audit version, not only a saved one.
+    repo = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "PYTHONPATH": str(repo)}
+    cut = train["timestamp"].max() - (NEW_HOURS - 1) * HOUR
+    train.loc[train["timestamp"] < cut].to_parquet(tmp_path / "panel.pq")
+    train.loc[train["timestamp"] > cut].to_parquet(tmp_path / "late.pq")
+    files = ["--data", "panel.pq", "--holdout", "late.pq"]
+    strategy = str(repo / "strategies" / "baseline_flow.py")
+    audit = subprocess.run(
+        [sys.executable, "-m", "src.audit", strategy, *files],
+        capture_output=True, text=True, timeout=120, check=False,
+        cwd=tmp_path, env=env,
+    )
+    assert audit.returncode == 2
+    (tmp_path / "baseline_flow.txt").write_text(audit.stdout + audit.stderr)
+    done = subprocess.run(
+        [sys.executable, "-m", "src.contrib.yousof", *files,
+         "baseline_flow.txt"],
+        capture_output=True, text=True, timeout=60, check=False,
+        cwd=tmp_path, env=env,
+    )
+    assert done.returncode == 0, done.stderr
+    panel = file_hash(tmp_path / "panel.pq")
+    late = file_hash(tmp_path / "late.pq")
+    error = (
+        f"Error: holdout starts at {cut + HOUR}, expected {cut}, one hour "
+        "after the --data panel ends."
+    )
+    assert done.stdout.splitlines() == [
+        "#### `baseline_flow`",
+        "",
+        f"Run with panel `panel.pq` (`{panel}`), holdout `late.pq` "
+        f"(`{late}`).",
+        "",
+        f"- `no audit report in the text, which starts with {error!r}`",
+    ]
+
+
+def test_command_line_with_data_files(
+    train: pd.DataFrame, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = REPORTS / REJECT_REPORT
+    assert main(["--data", str(TRAIN), str(report)]) == 0
+    files = {"panel": (str(TRAIN), TRAIN_SHA)}
+    table = audit_table(parse_audit_report(_report(report.name)), None, files)
+    assert capsys.readouterr().out == table + "\n"
+    # An unreadable data file fails the command, not the table.
+    assert main(["--holdout", "gone.parquet", str(report)]) == 1
+    assert "holdout `gone.parquet` (not readable)" in capsys.readouterr().out
+
+
+def test_command_line(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reports = [REPORTS / REJECT_REPORT, REPORTS / PASS_REPORT]
+    tables = [_table(_report(p.name)) for p in reports]
+    assert main([str(p) for p in reports]) == 0
+    assert capsys.readouterr().out == "\n\n".join(tables) + "\n"
+    # Several reports on stdin, as from a concatenated log.
+    text = "".join(_report(p.name) for p in reports)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+    assert main([]) == 0
+    assert capsys.readouterr().out == "\n\n".join(tables) + "\n"
+    # An unreadable file is named and fails the command, not the rest.
+    missing = tmp_path / "nothing.txt"
+    assert main([str(missing), str(reports[0])]) == 1
+    out = capsys.readouterr().out
+    assert out.startswith(f"Could not read `{missing}`: ")
+    assert out.endswith(tables[0] + "\n")
+
+
+def test_runs_as_a_copied_script(tmp_path: Path) -> None:
+    # The way CI calls it: a copy of the file as it is on main.
+    repo = Path(__file__).resolve().parents[2]
+    script = tmp_path / "audit_table.py"
+    script.write_bytes((repo / "src/contrib/yousof.py").read_bytes())
+    path = REPORTS / PASS_REPORT
+    done = subprocess.run(
+        [sys.executable, str(script), str(path)],
+        capture_output=True, text=True, timeout=60, check=False,
+        env={**os.environ, "PYTHONPATH": str(repo)},
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == _table(_report(path.name)) + "\n"
+
+
+def test_runs_as_a_module() -> None:
+    path = REPORTS / PASS_REPORT
+    done = subprocess.run(
+        [sys.executable, "-m", "src.contrib.yousof", str(path)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == _table(_report(path.name)) + "\n"
