@@ -175,3 +175,35 @@ def test_planted_reversion_separates_ic() -> None:
 
 def _signal(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return df, -close_location_residual(df)
+
+
+# --- smoothed residual (Part 2 signal) -------------------------------------------------------
+
+
+def test_smoothed_residual_span1_equals_residual(train: pd.DataFrame) -> None:
+    from src.contrib.angelo import smoothed_close_location_residual
+
+    head = train[train["timestamp"] < train["timestamp"].iloc[0] + pd.Timedelta(days=30)]
+    pd.testing.assert_series_equal(
+        smoothed_close_location_residual(head, 1), close_location_residual(head), check_names=False
+    )
+
+
+@pytest.mark.parametrize("span", [6, 24])
+def test_smoothed_residual_orthogonal_and_causal(train: pd.DataFrame, span: int) -> None:
+    from src.contrib.angelo import smoothed_close_location_residual
+
+    head = train[train["timestamp"] < train["timestamp"].iloc[0] + pd.Timedelta(days=60)]
+    s = smoothed_close_location_residual(head, span)
+    r_k = np.log(head["close"]).groupby(head["symbol"]).diff(span)
+    ok = s.notna()
+    g = pd.DataFrame({"ts": head["timestamp"][ok], "s": s[ok], "r": r_k[ok]})
+    g["rd"] = g["r"] - g.groupby("ts")["r"].transform("mean")
+    assert g.groupby("ts")["s"].mean().abs().max() < 1e-12
+    assert (g["s"] * g["rd"]).groupby(g["ts"]).mean().abs().max() < 1e-12
+
+    cut = head["timestamp"].unique()[len(head["timestamp"].unique()) // 2]
+    part = head[head["timestamp"] <= cut]
+    np.testing.assert_allclose(
+        smoothed_close_location_residual(part, span).to_numpy(), s.loc[part.index].to_numpy(), atol=1e-15, equal_nan=True
+    )

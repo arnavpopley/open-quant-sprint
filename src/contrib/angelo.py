@@ -79,3 +79,21 @@ def close_location_residual(df: pd.DataFrame) -> pd.Series:
     cl = close_location(df)
     r = bar_log_return(df)
     return _cs_ols_residual(df["timestamp"], cl, r).rename("close_location_residual")
+
+
+def smoothed_close_location_residual(df: pd.DataFrame, span: int) -> pd.Series:
+    """
+    Causal EWM (per symbol, ``span`` hours) of ``close_location_residual``, residualized again at each
+    timestamp on the ``span``-hour log return over the same window. Averaging the gap over several
+    hours would otherwise pick up plain reversal of the window's return.
+
+    ``span = 1`` returns ``close_location_residual`` unchanged (it is already orthogonal to the 1h return).
+    """
+    res = close_location_residual(df)
+    if span <= 1:
+        return res.rename("smoothed_close_location_residual")
+    sym = df["symbol"].to_numpy()
+    sm = res.groupby(sym, sort=False).transform(lambda x: x.ewm(span=span, min_periods=1).mean())
+    lc = pd.Series(np.log(df["close"].to_numpy(dtype=np.float64)), index=df.index)
+    r_k = lc.groupby(sym, sort=False).diff(span)
+    return _cs_ols_residual(df["timestamp"], sm, r_k).rename("smoothed_close_location_residual")
