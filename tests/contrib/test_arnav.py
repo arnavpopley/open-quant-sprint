@@ -62,7 +62,7 @@ def _turnover(df: pd.DataFrame, w: pd.Series) -> pd.Series:
 def test_trades_less_during_volatility_spike() -> None:
     n_hours, n_sym = 600, 4
     ranges = np.full((n_hours, n_sym), 0.01)
-    spike = slice(300, 348)  # 48 hours with five times the usual high-low range
+    spike = slice(300, 348)  # 48 hours with 5 times the usual high-low range
     ranges[spike] = 0.05
     df = _panel(ranges)
     target = _noisy_targets(df)
@@ -73,7 +73,8 @@ def test_trades_less_during_volatility_spike() -> None:
     ratio = vol_band_ratio(df)
     hour = df.groupby("symbol").cumcount().to_numpy()
     in_spike = (ratio > 1.0).to_numpy()
-    # The band widens only once the spike is in the 24h window and only while it is.
+    # The band widens only once the spike is inside the 24-row window, and only while it stays there.
+    # The first spike bar already enters sigma on its own row, hence nearly every spike row is wider.
     assert in_spike[hour < spike.start].sum() == 0
     assert in_spike[(hour >= spike.start) & (hour < spike.stop)].mean() > 0.95
     assert ratio.max() == pytest.approx(4.0)
@@ -82,6 +83,7 @@ def test_trades_less_during_volatility_spike() -> None:
     before = hour < spike.start
     np.testing.assert_array_equal(scaled[before].to_numpy(), fixed[before].to_numpy())
 
+    # Strictly lower for every symbol and below half in total, so the result does not rest on 1 symbol.
     to_fixed = _turnover(df, fixed)
     to_scaled = _turnover(df, scaled)
     for sym in df["symbol"].unique():
@@ -102,6 +104,8 @@ def test_flat_volatility_equals_fixed_band(base_buffer: float) -> None:
     target = _noisy_targets(df)
     target.iloc[::37] = np.nan  # NaN targets count as 0 in both
 
+    # The ratio has to be exactly 1 on every row for the 2 outputs to match bit for bit, hence it is
+    # checked first.
     assert (vol_band_ratio(df) == 1.0).all()
     pd.testing.assert_series_equal(
         vol_scaled_deadband(df, target, base_buffer=base_buffer),
@@ -126,6 +130,9 @@ def test_causal_on_prefixes() -> None:
     full_ratio = vol_band_ratio(df)
     assert (full_ratio > 1.0).mean() > 0.1  # the band does widen on this panel
 
+    # Each cut keeps whole timestamps, the same as the cuts in the audit. The cuts fall in the warm-up,
+    # inside widened stretches, and near the end. The target is sliced with the panel, since only the
+    # deadband is under test here.
     ts = df["timestamp"].drop_duplicates().sort_values().reset_index(drop=True)
     for k in (5, 30, 100, 180, 333, 512, 777, len(ts) - 2):
         cut = ts.iloc[k]
@@ -146,6 +153,7 @@ def test_no_leak_across_symbols() -> None:
     is_s1 = other["symbol"] == "S1"
     other.loc[is_s1, "high"] = other.loc[is_s1, "close"] * 1.2  # S1 becomes very volatile
     changed = vol_scaled_deadband(other, target)
+    # Only S1 is changed, hence every other symbol has to give exactly the same weights as before.
     assert not np.allclose(changed[is_s1], base[is_s1])
     pd.testing.assert_series_equal(changed[~is_s1], base[~is_s1])
 
@@ -159,6 +167,7 @@ def test_index_alignment_and_nan_targets() -> None:
     target.iloc[::11] = np.nan
     ref = vol_scaled_deadband(df, target)
 
+    # The same panel under a non-default index has to give the same numbers, under the new labels.
     shifted = df.copy()
     shifted.index = shifted.index * 10 + 7
     t_shifted = pd.Series(target.to_numpy(), index=shifted.index)
@@ -180,6 +189,8 @@ def test_ratio_warm_up_bounds_and_zero_range() -> None:
     ratio = vol_band_ratio(df, max_ratio=4.0)
     hour = df.groupby("symbol").cumcount().to_numpy()
 
+    # sigma needs 12 rows and its baseline another 84 after the shift, hence the first 95 rows of each
+    # symbol use the fixed band.
     sigma = parkinson_volatility(df)
     assert sigma[hour < 11].isna().all()
     assert (ratio[hour < 11 + 84] == 1.0).all()  # sigma or its baseline not defined yet
@@ -219,6 +230,7 @@ def test_train_panel_alignment_and_turnover(train: pd.DataFrame) -> None:
     ratio = vol_band_ratio(train)
     assert ratio.between(1.0, 4.0).all()
     widened = (ratio > 1.0).to_numpy()
+    # About half the rows are widened, which follows from the median baseline (module docstring).
     assert 0.2 < widened.mean() < 0.8
     assert _turnover(train, scaled)[widened].sum() < _turnover(train, fixed)[widened].sum()
     assert _turnover(train, scaled).sum() < _turnover(train, fixed).sum()
