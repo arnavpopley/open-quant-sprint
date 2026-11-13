@@ -16,8 +16,8 @@ and including that row's own (the rate settles at the start of the bar, so it is
 and never the next one. Binance shows a live estimate of the next rate, however, the dataset has no
 such estimate, so the strategy uses settled rates only and carry pays only if funding persists.
 
-This file is built up 1 piece at a time. So far it builds the funding signal for every row, and
-compute_weights still returns a flat book.
+This file is built up 1 piece at a time. So far it builds the funding signal for every row and ranks
+it across symbols, and compute_weights still returns a flat book.
 """
 
 from __future__ import annotations
@@ -52,6 +52,13 @@ def funding_signal(df: pd.DataFrame, span: int = SPAN, min_settlements: int = MI
     ewm = settled_funding_ewm(df, span=span, min_settlements=min_settlements)
     # each hour keeps the last settled value of its own symbol, nothing from a later row
     return ewm.groupby(df["symbol"].to_numpy(), sort=False).ffill()
+
+
+def rank_signal(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
+    """Rank of the signal across symbols at each timestamp, 1 = lowest funding, NaN where there is no signal yet."""
+    # ties share the average rank, so the result does not depend on the order of the rows
+    # symbols without a signal stay NaN and are simply left out of that timestamp's ranking
+    return signal.groupby(df["timestamp"]).rank(method="average")
 
 
 def compute_weights(df: pd.DataFrame) -> pd.Series:
