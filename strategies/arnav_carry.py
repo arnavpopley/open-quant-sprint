@@ -92,11 +92,18 @@ def hold_between_rebalances(df: pd.DataFrame, target: pd.Series) -> pd.Series:
     return target.where(is_reb).groupby(df["symbol"].to_numpy(), sort=False).ffill().fillna(0.0)
 
 
-def compute_weights(df: pd.DataFrame) -> pd.Series:
-    target = hold_between_rebalances(df, rank_target(df, funding_signal(df)))
+def build_weights(df: pd.DataFrame, span: int = SPAN, base_buffer: float = BASE_BUFFER) -> pd.Series:
+    """The whole book from the funding signal, with the span and the band as arguments."""
+    # the arguments are only there so the breakdown can switch the deadband off (base_buffer=0) on the
+    # same code; compute_weights always calls it with the fixed values above
+    target = hold_between_rebalances(df, rank_target(df, funding_signal(df, span=span)))
     # small moves in the target (1-place rank swaps are 0.01) stay inside the band and cost no fees
     # the band acts per symbol, so a blocked trade can go through on a later hour once the band narrows
-    w = vol_scaled_deadband(df, target, base_buffer=BASE_BUFFER, vol_window=VOL_WINDOW)
+    w = vol_scaled_deadband(df, target, base_buffer=base_buffer, vol_window=VOL_WINDOW)
     # the band can also leave the book a little net long or short, so take the mean back out
     # this costs a small trade in every name whenever the net changes, which is the price of staying neutral
     return w - w.groupby(df["timestamp"]).transform("mean")
+
+
+def compute_weights(df: pd.DataFrame) -> pd.Series:
+    return build_weights(df)
