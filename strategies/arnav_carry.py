@@ -9,8 +9,15 @@ and the cost of trading in and out.
 The book is dollar-neutral, hence the level of funding that every symbol pays cancels out, and the
 book earns only the spread between the rates of its longs and its shorts.
 
-This file is built up 1 piece at a time. So far it picks out the settlement rows and averages each
-symbol's settled rates, and compute_weights still returns a flat book.
+Timing. The weight returned on a row is filled at the close of that bar and is the position held
+across the next settlement. Hence a weight set on the 00:00 row is filled at 01:00 and is charged or
+paid the 08:00 rate, which is not in the data at 01:00. The signal on a row uses the settlements up to
+and including that row's own (the rate settles at the start of the bar, so it is known by its close)
+and never the next one. Binance shows a live estimate of the next rate, however, the dataset has no
+such estimate, so the strategy uses settled rates only and carry pays only if funding persists.
+
+This file is built up 1 piece at a time. So far it builds the funding signal for every row, and
+compute_weights still returns a flat book.
 """
 
 from __future__ import annotations
@@ -38,6 +45,13 @@ def settled_funding_ewm(df: pd.DataFrame, span: int = SPAN, min_settlements: int
     # grouped by symbol, so one coin's funding never leaks into another's average
     ewm = settled.groupby(sym, sort=False).transform(lambda x: x.ewm(span=span, min_periods=min_settlements).mean())
     return ewm.reindex(df.index)
+
+
+def funding_signal(df: pd.DataFrame, span: int = SPAN, min_settlements: int = MIN_SETTLEMENTS) -> pd.Series:
+    """The latest settled EWM on every row: a row sees its own settlement and earlier ones, never the next."""
+    ewm = settled_funding_ewm(df, span=span, min_settlements=min_settlements)
+    # each hour keeps the last settled value of its own symbol, nothing from a later row
+    return ewm.groupby(df["symbol"].to_numpy(), sort=False).ffill()
 
 
 def compute_weights(df: pd.DataFrame) -> pd.Series:
