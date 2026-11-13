@@ -16,8 +16,8 @@ and including that row's own (the rate settles at the start of the bar, so it is
 and never the next one. Binance shows a live estimate of the next rate, however, the dataset has no
 such estimate, so the strategy uses settled rates only and carry pays only if funding persists.
 
-This file is built up 1 piece at a time. So far it builds the funding signal for every row and ranks
-it across symbols, and compute_weights still returns a flat book.
+This file is built up 1 piece at a time. So far it builds the funding signal, ranks it across
+symbols, and turns the ranks into weights on every hour, with no rebalance schedule or deadband yet.
 """
 
 from __future__ import annotations
@@ -61,5 +61,18 @@ def rank_signal(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
     return signal.groupby(df["timestamp"]).rank(method="average")
 
 
+def rank_target(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
+    """Short high funding, long low funding, linear in rank, with sum |w| = 1 and sum w = 0 at each timestamp."""
+    ts = df["timestamp"]
+    r = rank_signal(df, signal)
+    n = signal.notna().groupby(ts).transform("sum")
+    # rank 1 is the lowest funding, so (n + 1) / 2 - rank is + for the longs and - for the shorts
+    # with all 20 ranked the extremes get 0.095 and 1 place apart is 0.01, so small swaps barely move it
+    u = ((n + 1.0) / 2.0 - r).where(n >= 2)
+    # fewer than 2 ranked symbols means no spread to trade, so no weight
+    l1 = u.abs().groupby(ts).transform("sum")
+    return (u / l1.where(l1 > 0)).fillna(0.0)
+
+
 def compute_weights(df: pd.DataFrame) -> pd.Series:
-    return pd.Series(0.0, index=df.index)
+    return rank_target(df, funding_signal(df))
