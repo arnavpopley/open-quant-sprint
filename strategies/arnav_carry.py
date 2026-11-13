@@ -18,8 +18,8 @@ such estimate, so the strategy uses settled rates only and carry pays only if fu
 
 This file is built up 1 piece at a time. So far it builds the funding signal, ranks it across
 symbols, turns the ranks into weights, holds them between rebalance rows, and filters them with
-vol_scaled_deadband (src/contrib/arnav.py). The book is not re-centred after the deadband yet, so it
-can carry a small net position.
+vol_scaled_deadband (src/contrib/arnav.py), then centres the book again so that sum w = 0 at every
+timestamp.
 """
 
 from __future__ import annotations
@@ -96,4 +96,7 @@ def compute_weights(df: pd.DataFrame) -> pd.Series:
     target = hold_between_rebalances(df, rank_target(df, funding_signal(df)))
     # small moves in the target (1-place rank swaps are 0.01) stay inside the band and cost no fees
     # the band acts per symbol, so a blocked trade can go through on a later hour once the band narrows
-    return vol_scaled_deadband(df, target, base_buffer=BASE_BUFFER, vol_window=VOL_WINDOW)
+    w = vol_scaled_deadband(df, target, base_buffer=BASE_BUFFER, vol_window=VOL_WINDOW)
+    # the band can also leave the book a little net long or short, so take the mean back out
+    # this costs a small trade in every name whenever the net changes, which is the price of staying neutral
+    return w - w.groupby(df["timestamp"]).transform("mean")
