@@ -17,7 +17,7 @@ and never the next one. Binance shows a live estimate of the next rate, however,
 such estimate, so the strategy uses settled rates only and carry pays only if funding persists.
 
 This file is built up 1 piece at a time. So far it builds the funding signal, ranks it across
-symbols, and turns the ranks into weights on every hour, with no rebalance schedule or deadband yet.
+symbols, turns the ranks into weights, and holds them between rebalance rows, with no deadband yet.
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ import pandas as pd
 SETTLEMENT_HOURS = (0, 8, 16)
 SPAN = 21  # in settlements, so 1 week; a settlement's weight halves about every 7 settlements (2.4 days)
 MIN_SETTLEMENTS = 3  # a symbol needs 1 day of settlements before it gets a signal
+# rebalance on the settlement rows themselves, the first row each new rate is in the data
+# filled at 01:00, 09:00, 17:00, so 7 hours before the next settlement, and a 1h delay still holds it
+REBALANCE_HOURS = (0, 8, 16)
 
 
 def settlement_rows(df: pd.DataFrame) -> pd.Series:
@@ -74,5 +77,13 @@ def rank_target(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
     return (u / l1.where(l1 > 0)).fillna(0.0)
 
 
+def hold_between_rebalances(df: pd.DataFrame, target: pd.Series) -> pd.Series:
+    """The target moves only on the rebalance rows and is held on the hours in between."""
+    is_reb = df["timestamp"].dt.hour.isin(REBALANCE_HOURS).to_numpy()
+    # with rebalances on the settlement rows this changes nothing, since the signal only moves there
+    # anyway; it keeps the schedule explicit in case the two ever differ
+    return target.where(is_reb).groupby(df["symbol"].to_numpy(), sort=False).ffill().fillna(0.0)
+
+
 def compute_weights(df: pd.DataFrame) -> pd.Series:
-    return rank_target(df, funding_signal(df))
+    return hold_between_rebalances(df, rank_target(df, funding_signal(df)))
