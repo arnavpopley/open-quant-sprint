@@ -17,12 +17,16 @@ and never the next one. Binance shows a live estimate of the next rate, however,
 such estimate, so the strategy uses settled rates only and carry pays only if funding persists.
 
 This file is built up 1 piece at a time. So far it builds the funding signal, ranks it across
-symbols, turns the ranks into weights, and holds them between rebalance rows, with no deadband yet.
+symbols, turns the ranks into weights, holds them between rebalance rows, and filters them with
+vol_scaled_deadband (src/contrib/arnav.py). The book is not re-centred after the deadband yet, so it
+can carry a small net position.
 """
 
 from __future__ import annotations
 
 import pandas as pd
+
+from src.contrib.arnav import vol_scaled_deadband
 
 SETTLEMENT_HOURS = (0, 8, 16)
 SPAN = 21  # in settlements, so 1 week; a settlement's weight halves about every 7 settlements (2.4 days)
@@ -30,6 +34,9 @@ MIN_SETTLEMENTS = 3  # a symbol needs 1 day of settlements before it gets a sign
 # rebalance on the settlement rows themselves, the first row each new rate is in the data
 # filled at 01:00, 09:00, 17:00, so 7 hours before the next settlement, and a 1h delay still holds it
 REBALANCE_HOURS = (0, 8, 16)
+# the Part 1 band: 1.5 %, widening up to 4x when a symbol's vol is high against its own last week
+BASE_BUFFER = 0.015
+VOL_WINDOW = 24
 
 
 def settlement_rows(df: pd.DataFrame) -> pd.Series:
@@ -86,4 +93,7 @@ def hold_between_rebalances(df: pd.DataFrame, target: pd.Series) -> pd.Series:
 
 
 def compute_weights(df: pd.DataFrame) -> pd.Series:
-    return hold_between_rebalances(df, rank_target(df, funding_signal(df)))
+    target = hold_between_rebalances(df, rank_target(df, funding_signal(df)))
+    # small moves in the target (1-place rank swaps are 0.01) stay inside the band and cost no fees
+    # the band acts per symbol, so a blocked trade can go through on a later hour once the band narrows
+    return vol_scaled_deadband(df, target, base_buffer=BASE_BUFFER, vol_window=VOL_WINDOW)
