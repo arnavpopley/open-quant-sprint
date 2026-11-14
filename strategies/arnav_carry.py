@@ -24,6 +24,7 @@ timestamp.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from src.contrib.arnav import vol_scaled_deadband
@@ -37,6 +38,8 @@ REBALANCE_HOURS = (0, 8, 16)
 # the Part 1 band: 1.5 %, widening up to 4x when a symbol's vol is high against its own last week
 BASE_BUFFER = 0.015
 VOL_WINDOW = 24
+SCHEME = "rank"  # the primary book; "top5" is the pre-registered secondary variant
+TOP_K = 5
 
 
 def settlement_rows(df: pd.DataFrame) -> pd.Series:
@@ -84,6 +87,23 @@ def rank_target(df: pd.DataFrame, signal: pd.Series) -> pd.Series:
     return (u / l1.where(l1 > 0)).fillna(0.0)
 
 
+def top_k_target(df: pd.DataFrame, signal: pd.Series, k: int = TOP_K) -> pd.Series:
+    """Short the k highest-funding names and long the k lowest, 1 / (2k) each (fewer when fewer are ranked)."""
+    ts = df["timestamp"]
+    n = signal.notna().groupby(ts).transform("sum")
+    k_t = np.minimum(k, n // 2)
+    # "first" breaks ties by row order, which the (timestamp, symbol) sort fixes, so the same names get
+    # picked on every run and on every prefix of the panel
+    hi = signal.groupby(ts).rank(method="first", ascending=False)
+    lo = signal.groupby(ts).rank(method="first", ascending=True)
+    w = np.where(hi <= k_t, -1.0, 0.0) + np.where(lo <= k_t, 1.0, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        w = np.where(k_t > 0, w / (2.0 * k_t), 0.0)
+    # every change of weight here is 0.1 or more and the band tops out at 0.06, so the deadband
+    # never blocks a trade in this book; it doubles as the book without turnover control
+    return pd.Series(w, index=df.index).fillna(0.0)
+
+
 def hold_between_rebalances(df: pd.DataFrame, target: pd.Series) -> pd.Series:
     """The target moves only on the rebalance rows and is held on the hours in between."""
     is_reb = df["timestamp"].dt.hour.isin(REBALANCE_HOURS).to_numpy()
@@ -92,11 +112,23 @@ def hold_between_rebalances(df: pd.DataFrame, target: pd.Series) -> pd.Series:
     return target.where(is_reb).groupby(df["symbol"].to_numpy(), sort=False).ffill().fillna(0.0)
 
 
-def build_weights(df: pd.DataFrame, span: int = SPAN, base_buffer: float = BASE_BUFFER) -> pd.Series:
-    """The whole book from the funding signal, with the span and the band as arguments."""
-    # the arguments are only there so the breakdown can switch the deadband off (base_buffer=0) on the
-    # same code; compute_weights always calls it with the fixed values above
-    target = hold_between_rebalances(df, rank_target(df, funding_signal(df, span=span)))
+def build_weights(
+    df: pd.DataFrame,
+    scheme: str = SCHEME,
+    span: int = SPAN,
+    base_buffer: float = BASE_BUFFER,
+) -> pd.Series:
+    """The whole book from the funding signal, with the scheme, the span, and the band as arguments."""
+    # the arguments are only there so the breakdown can run the top5 variant and switch the deadband
+    # off (base_buffer=0) on the same code; compute_weights always calls it with the fixed values above
+    signal = funding_signal(df, span=span)
+    if scheme == "rank":
+        target = rank_target(df, signal)
+    elif scheme == "top5":
+        target = top_k_target(df, signal, k=TOP_K)
+    else:
+        raise ValueError(f"unknown scheme {scheme!r}")
+    target = hold_between_rebalances(df, target)
     # small moves in the target (1-place rank swaps are 0.01) stay inside the band and cost no fees
     # the band acts per symbol, so a blocked trade can go through on a later hour once the band narrows
     w = vol_scaled_deadband(df, target, base_buffer=base_buffer, vol_window=VOL_WINDOW)
