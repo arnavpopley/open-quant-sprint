@@ -16,10 +16,18 @@ and including that row's own (the rate settles at the start of the bar, so it is
 and never the next one. Binance shows a live estimate of the next rate, however, the dataset has no
 such estimate, so the strategy uses settled rates only and carry pays only if funding persists.
 
-This file is built up 1 piece at a time. So far it builds the funding signal, ranks it across
-symbols, turns the ranks into weights, holds them between rebalance rows, and filters them with
-vol_scaled_deadband (src/contrib/arnav.py), then centres the book again so that sum w = 0 at every
-timestamp.
+The book. Each symbol's signal is an EWM of its settled funding rates, carried forward to the hours
+after each settlement. At every rebalance row the symbols are ranked by the signal, and the book is
+short the high-funding names and long the low-funding names, linear in rank, with sum |w| = 1. The
+target is held between rebalance rows, filtered with vol_scaled_deadband (src/contrib/arnav.py), and
+centred again so that sum w = 0 at every timestamp.
+
+Pre-registered primary cell (Track 04 Part 2 PR): SCHEME = "rank", SPAN = 21, MIN_SETTLEMENTS = 3,
+settlement rows picked by the clock, REBALANCE_HOURS = (0, 8, 16), BASE_BUFFER = 0.015, and
+VOL_WINDOW = 24 (deadband history window 168 rows and ratio cap 4, the Part 1 defaults). These values
+are fixed before the first full-panel run and are not tuned on results. The pre-registered secondary
+variant is build_weights(df, scheme="top5"), and it is reported next to the primary cell, not used to
+choose between them. The hypothesis and the prior are in the PR description.
 """
 
 from __future__ import annotations
