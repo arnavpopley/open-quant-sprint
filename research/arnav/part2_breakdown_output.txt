@@ -1,0 +1,52 @@
+rows 297420, 14871 hours (1.70 years)
+
+=== primary: rank, deadband on (pre-registered) ===
+PnL split at 5 bps (totals over each period, funding earned is positive)
+full panel             Sharpe  +0.41 | price  +12.59% | funding  +8.85% (+5.21%/yr) | fees  -12.04% | net   +9.40% | turnover 0.0162/h
+first 70% (in-sample)  Sharpe  +0.93 | price  +16.36% | funding  +6.61% (+5.56%/yr) | fees   -8.22% | net  +14.75% | turnover 0.0158/h
+last 30% (out-of-sample) Sharpe  -0.72 | price   -3.21% | funding  +2.22% (+4.38%/yr) | fees   -3.85% | net   -4.84% | turnover 0.0174/h
+full, lag test (+1h)   Sharpe  +0.33 | price  +10.55% | funding  +8.84% (+5.21%/yr) | fees  -12.03% | net   +7.36% | turnover 0.0162/h
+last 30% at 0 bps: Sharpe -0.15 (does it fail even without fees?)
+break-even fee, full panel: 8.91 bps
+fee curve: 0:+0.94, 2:+0.73, 4:+0.52, 5:+0.41, 6:+0.31, 7:+0.20, 8:+0.10, 9:-0.01, 10:-0.12, 12:-0.33, 15:-0.65, 20:-1.18
+tiered fees (~7.7 bps mean): Sharpe +0.13
+null check [8]: mean -0.76 (sd 0.61, passes if |mean| < 0.75), actual gross SR +0.57, p=0.0249 | wick share 2.1%
+price PnL = static tilt -15.24% + timing +27.83% (= +12.59%)
+average held weight and summed hourly return, most short and most long names:
+    UNIUSDT   mean w -0.0528 | summed return    +9.2% | tilt PnL  -0.49%
+    LINKUSDT  mean w -0.0454 | summed return    +3.2% | tilt PnL  -0.14%
+    LTCUSDT   mean w -0.0328 | summed return   -19.5% | tilt PnL  +0.64%
+    BTCUSDT   mean w -0.0277 | summed return    -3.3% | tilt PnL  +0.09%
+    SOLUSDT   mean w +0.0338 | summed return   -12.2% | tilt PnL  -0.41%
+    INJUSDT   mean w +0.0417 | summed return   -26.9% | tilt PnL  -1.12%
+    APTUSDT   mean w +0.0469 | summed return  -196.9% | tilt PnL  -9.24%
+    ATOMUSDT  mean w +0.0744 | summed return   -84.3% | tilt PnL  -6.28%
+turnover on the 00/08/16 rows: 95.4% of the total
+
+=== deadband on vs off (rank book, 5 bps) ===
+deadband on            Sharpe  +0.41 | price  +12.59% | funding  +8.85% (+5.21%/yr) | fees  -12.04% | net   +9.40% | turnover 0.0162/h
+deadband off           Sharpe  +0.52 | price  +16.97% | funding  +9.35% (+5.51%/yr) | fees  -14.23% | net  +12.09% | turnover 0.0191/h
+turnover change from the deadband: -15.2%
+
+=== secondary: top5 (pre-registered, not used to choose) ===
+PnL split at 5 bps (totals over each period, funding earned is positive)
+full panel             Sharpe  +0.29 | price  +13.39% | funding +10.55% (+6.21%/yr) | fees  -15.97% | net   +7.97% | turnover 0.0215/h
+first 70% (in-sample)  Sharpe  +0.86 | price  +20.02% | funding  +7.86% (+6.61%/yr) | fees  -10.94% | net  +16.94% | turnover 0.0210/h
+last 30% (out-of-sample) Sharpe  -1.06 | price   -6.27% | funding  +2.67% (+5.27%/yr) | fees   -5.07% | net   -8.67% | turnover 0.0228/h
+full, lag test (+1h)   Sharpe  +0.13 | price   +9.03% | funding +10.55% (+6.21%/yr) | fees  -15.97% | net   +3.61% | turnover 0.0215/h
+last 30% at 0 bps: Sharpe -0.44 (does it fail even without fees?)
+break-even fee, full panel: 7.49 bps
+fee curve: 0:+0.86, 2:+0.63, 4:+0.40, 5:+0.29, 6:+0.17, 7:+0.06, 8:-0.06, 9:-0.17, 10:-0.29, 12:-0.52, 15:-0.86, 20:-1.43
+tiered fees (~7.7 bps mean): Sharpe -0.02
+null check [8]: mean -0.75 (sd 0.65, passes if |mean| < 0.75), actual gross SR +0.48, p=0.0249 | wick share 2.2%
+price PnL = static tilt -18.00% + timing +31.40% (= +13.39%)
+average held weight and summed hourly return, most short and most long names:
+    UNIUSDT   mean w -0.0600 | summed return    +9.2% | tilt PnL  -0.55%
+    LINKUSDT  mean w -0.0550 | summed return    +3.2% | tilt PnL  -0.18%
+    LTCUSDT   mean w -0.0351 | summed return   -19.5% | tilt PnL  +0.69%
+    BTCUSDT   mean w -0.0336 | summed return    -3.3% | tilt PnL  +0.11%
+    SOLUSDT   mean w +0.0375 | summed return   -12.2% | tilt PnL  -0.46%
+    INJUSDT   mean w +0.0482 | summed return   -26.9% | tilt PnL  -1.30%
+    APTUSDT   mean w +0.0576 | summed return  -196.9% | tilt PnL -11.35%
+    ATOMUSDT  mean w +0.0886 | summed return   -84.3% | tilt PnL  -7.48%
+turnover on the 00/08/16 rows: 100.0% of the total
